@@ -1015,8 +1015,10 @@ object IcebergReflection extends Logging {
    *     type, which fails the native scan.
    *   - BYTE_ARRAY backing a binary column: the evaluator decodes column-index min/max as UTF-8
    *     (String::from_utf8(..).unwrap()) before the predicate closure runs, so non-UTF-8 bounds
-   *     panic the native scan even for a bare IS [NOT] NULL. Extend this set as Iceberg adds
-   *     types with either layout (e.g. geometry).
+   *     panic the native scan even for a bare IS [NOT] NULL. V3 `geometry` / `geography` share
+   *     that layout (WKB in a BYTE_ARRAY), and `WHERE geom IS NOT NULL` is expressible in Spark
+   *     4.1 even though it has no spatial predicates, so they belong here too. Extend this set as
+   *     Iceberg adds further types with either layout.
    */
   def pageIndexUnsupportedColumns(schema: Any): Set[String] = {
     import scala.jdk.CollectionConverters._
@@ -1028,7 +1030,8 @@ object IcebergReflection extends Logging {
         val name = getMethod(column.getClass, "name").invoke(column).asInstanceOf[String]
         val typeStr = getMethod(column.getClass, "type").invoke(column).toString
         if (typeStr.startsWith("decimal(") || typeStr == "uuid" || typeStr.startsWith("fixed[") ||
-          typeStr == "binary") {
+          typeStr == "binary" || typeStr.startsWith("geometry(") ||
+          typeStr.startsWith("geography(")) {
           Some(name)
         } else {
           None
@@ -1089,6 +1092,12 @@ object IcebergReflection extends Logging {
             fieldName,
             typeStr,
             "Binary/fixed types not yet supported (Literal::try_from_json todo!())"))
+        } else if (typeStr.startsWith("geometry(") || typeStr.startsWith("geography(")) {
+          unsupportedTypes += ((
+            fieldName,
+            typeStr,
+            "Geospatial partition values cannot be deserialized (Literal::try_from_json has no " +
+              "geometry/geography arm)"))
         }
       }
     }

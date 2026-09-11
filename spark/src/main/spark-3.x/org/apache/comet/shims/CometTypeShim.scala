@@ -58,6 +58,12 @@ trait CometTypeShim {
   @nowarn // Spark 4.1 feature; TimeType doesn't exist in Spark 3.x.
   def isTimeType(dt: DataType): Boolean = false
 
+  @nowarn // Spark 4.1 feature; GeometryType/GeographyType don't exist in Spark 3.x.
+  def isGeospatialType(dt: DataType): Boolean = false
+
+  @nowarn // Spark 4.1 feature; GeometryType/GeographyType don't exist in Spark 3.x.
+  def geospatialSrid(dt: DataType): Option[Int] = None
+
   /**
    * `UTF8String.isValid` (which memoizes on the instance) only exists from Spark 4.0, so decode
    * here instead. Rejects the same sequences as Rust's `str::from_utf8`: overlong forms,

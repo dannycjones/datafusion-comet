@@ -5382,6 +5382,222 @@ class CometIcebergNativeSuite
     }
   }
 
+  // WKB (little-endian) for POINT(30 10), POINT(-71 42) and POINT(100 50). Uppercase because `hex`
+  // returns uppercase and `X'..'` literals are case-insensitive, so the same constant serves as
+  // both the written value and the expected read-back. Matches Iceberg's own TestSparkGeospatial.
+  private val geomWkb = "01010000000000000000003E400000000000002440"
+  private val geogWkb = "01010000000000000000C051C00000000000004540"
+  private val otherWkb = "010100000000000000000059400000000000004940"
+
+  /** Catalog + geospatial confs shared by the geometry/geography tests. */
+  private def withGeospatialCatalog(warehouseDir: File)(f: => Unit): Unit =
+    withSQLConf(
+      "spark.sql.catalog.test_cat" -> "org.apache.iceberg.spark.SparkCatalog",
+      "spark.sql.catalog.test_cat.type" -> "hadoop",
+      "spark.sql.catalog.test_cat.warehouse" -> warehouseDir.getAbsolutePath,
+      // Spark keeps GEOMETRY/GEOGRAPHY behind a flag in 4.1.
+      "spark.sql.geospatial.enabled" -> "true",
+      CometConf.COMET_ENABLED.key -> "true",
+      CometConf.COMET_EXEC_ENABLED.key -> "true",
+      CometConf.COMET_ICEBERG_NATIVE_ENABLED.key -> "true")(f)
+
+  /** Whether the Spark and Iceberg on the classpath both understand GEOMETRY / GEOGRAPHY. */
+  private def assumeGeospatialSupported(): Unit = {
+    assume(isSpark41Plus, "GEOMETRY/GEOGRAPHY require Spark 4.1+ (SPARK-52207)")
+    assume(icebergAvailable, "Iceberg not available in classpath")
+    // Iceberg's Spark type mapping for the V3 geospatial types landed after 1.11; on 1.11 the DDL
+    // below fails in TypeToSparkType, so skip rather than fail.
+    assume(
+      icebergVersionAtLeast(1, 12),
+      "Iceberg's Spark GEOMETRY/GEOGRAPHY mapping requires Iceberg 1.12+")
+  }
+
+  // A V3 `geometry` / `geography` value is pure WKB on disk, while a Spark GEOMETRY value is
+  // `[4-byte little-endian SRID | WKB]`, so the native scan reads iceberg-rust's binary Arrow array
+  // and prepends the column's SRID. This is the end-to-end check on that header: `st_asbinary`
+  // strips exactly four bytes, so an absent or misplaced header shows up as truncated WKB. Mirrors
+  // TestSparkGeospatial.testGeospatialWkbReadBack, plus the assertion that the read stayed in the
+  // native scan rather than falling back.
+  test("geometry and geography columns are read natively as WKB") {
+    assumeGeospatialSupported()
+    withTempIcebergDir { warehouseDir =>
+      withGeospatialCatalog(warehouseDir) {
+        val table = "test_cat.db.geo_wkb"
+        try {
+          // A bare GEOMETRY column is mixed-SRID, which Iceberg does not support, so pin the SRID
+          // to 4326 (OGC:CRS84). The geo types require format version 3.
+          spark.sql(
+            s"CREATE TABLE $table (id BIGINT, geom GEOMETRY(4326), geog GEOGRAPHY(4326)) " +
+              "USING iceberg TBLPROPERTIES ('format-version' = '3')")
+          // st_geomfromwkb yields SRID 0, so set it to the column's SRID for the write to be
+          // accepted.
+          spark.sql(
+            s"INSERT INTO $table VALUES " +
+              s"(1, st_setsrid(st_geomfromwkb(X'$geomWkb'), 4326), " +
+              s"st_setsrid(st_geogfromwkb(X'$geogWkb'), 4326)), " +
+              s"(2, st_setsrid(st_geomfromwkb(X'$otherWkb'), 4326), NULL), " +
+              "(3, NULL, NULL)")
+
+          // st_asbinary strips the SRID header back to the bytes that were written.
+          val projection =
+            s"SELECT id, hex(st_asbinary(geom)), hex(st_asbinary(geog)) FROM $table ORDER BY id"
+          checkIcebergNativeScan(projection)
+          // Spark parity alone would pass if both engines returned all nulls, so pin the values.
+          checkCometAnswer(
+            spark.sql(projection),
+            Seq(Row(1L, geomWkb, geogWkb), Row(2L, otherWkb, null), Row(3L, null, null)))
+
+          // Spark 4.1 has no spatial predicates, but IS [NOT] NULL is expressible, and Iceberg
+          // pushes it down as a residual. iceberg-rust's page-index evaluator decodes BYTE_ARRAY
+          // column-index bounds as UTF-8 and unwraps, so a WKB bound would panic the scan; geo
+          // columns are in pageIndexUnsupportedColumns to keep that residual off the native side.
+          checkIcebergNativeScan(s"SELECT id FROM $table WHERE geom IS NOT NULL ORDER BY id")
+          checkIcebergNativeScan(s"SELECT id FROM $table WHERE geog IS NULL ORDER BY id")
+
+          // Pruning the geo columns away must not change the plan, and a filter on a non-geo
+          // column still pushes down normally.
+          checkIcebergNativeScan(s"SELECT id FROM $table WHERE id > 1 ORDER BY id")
+        } finally {
+          spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
+        }
+      }
+    }
+  }
+
+  // The SRID a nested geospatial field needs travels in required-schema field metadata, which has
+  // no per-nested-field slot, so a struct holding one has to fall back rather than hand back WKB
+  // with no header. The Iceberg scan projects whole top-level columns, so reading any part of that
+  // struct falls back -- only a query that leaves the column out entirely stays native.
+  test("a geometry field nested in a struct falls back unless the struct is unprojected") {
+    assumeGeospatialSupported()
+    withTempIcebergDir { warehouseDir =>
+      withGeospatialCatalog(warehouseDir) {
+        val table = "test_cat.db.geo_nested"
+        try {
+          spark.sql(
+            s"CREATE TABLE $table (id BIGINT, " +
+              "nested STRUCT<label: STRING, geom: GEOMETRY(4326)>) " +
+              "USING iceberg TBLPROPERTIES ('format-version' = '3')")
+          spark.sql(
+            s"INSERT INTO $table VALUES " +
+              s"(1, named_struct('label', 'first', " +
+              s"'geom', st_setsrid(st_geomfromwkb(X'$geomWkb'), 4326))), " +
+              "(2, named_struct('label', 'no-geom', 'geom', NULL)), " +
+              "(3, NULL)")
+
+          val projection =
+            s"SELECT id, nested.label, hex(st_asbinary(nested.geom)) FROM $table ORDER BY id"
+          checkIcebergNativeScanFallback(
+            projection,
+            "a geospatial type nested in a struct cannot carry its SRID to native")
+          // Spark parity is asserted above; pin the values so an all-null answer cannot pass.
+          checkAnswer(
+            spark.sql(projection),
+            Seq(Row(1L, "first", geomWkb), Row(2L, "no-geom", null), Row(3L, null, null)))
+
+          // Reading the non-geo sibling still reads the whole struct, so it falls back too.
+          checkIcebergNativeScanFallback(
+            s"SELECT id, nested.label FROM $table ORDER BY id",
+            "the struct is projected whole, geospatial field included")
+
+          // Leaving the struct out of the projection puts the scan back on the native path.
+          checkIcebergNativeScan(s"SELECT id FROM $table ORDER BY id")
+          checkCometAnswer(
+            spark.sql(s"SELECT id FROM $table ORDER BY id"),
+            Seq(Row(1L), Row(2L), Row(3L)))
+        } finally {
+          spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
+        }
+      }
+    }
+  }
+
+  // A copy-on-write delete rewrites the surviving rows into a fresh data file, so the geo values go
+  // through the Iceberg writer and back out through the native reader with no delete files
+  // involved. Mirrors TestSparkGeospatial.testDeleteGeospatial for the copy-on-write mode.
+  test("copy-on-write deletes over a geospatial table stay native") {
+    assumeGeospatialSupported()
+    withTempIcebergDir { warehouseDir =>
+      withGeospatialCatalog(warehouseDir) {
+        val table = "test_cat.db.geo_cow_delete"
+        try {
+          spark.sql(
+            s"CREATE TABLE $table (id BIGINT, geom GEOMETRY(4326), geog GEOGRAPHY(4326)) " +
+              "USING iceberg TBLPROPERTIES ('format-version' = '3', " +
+              "'write.delete.mode' = 'copy-on-write')")
+          spark.sql(
+            s"INSERT INTO $table VALUES " +
+              s"(1, st_setsrid(st_geomfromwkb(X'$geomWkb'), 4326), " +
+              s"st_setsrid(st_geogfromwkb(X'$geogWkb'), 4326)), " +
+              s"(2, st_setsrid(st_geomfromwkb(X'$otherWkb'), 4326), NULL)")
+
+          // Spark has no spatial predicate, so filter on id.
+          spark.sql(s"DELETE FROM $table WHERE id = 1")
+
+          val projection =
+            s"SELECT id, hex(st_asbinary(geom)), hex(st_asbinary(geog)) FROM $table ORDER BY id"
+          checkIcebergNativeScan(projection)
+          checkCometAnswer(spark.sql(projection), Seq(Row(2L, otherWkb, null)))
+        } finally {
+          spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
+        }
+      }
+    }
+  }
+
+  // In V3, a merge-on-read position delete is written as a Puffin deletion vector, which
+  // iceberg-rust cannot apply yet, so the scan falls back whatever the column types are. This pins
+  // that the geospatial columns do not change the outcome: the fallback reason is still the delete
+  // file format, and Spark's own reader returns the right rows. Flip the assertion to
+  // `checkIcebergNativeScan` when native deletion-vector reads land.
+  test("merge-on-read deletes over a geospatial table fall back for the deletion vector") {
+    assumeGeospatialSupported()
+    withTempIcebergDir { warehouseDir =>
+      withGeospatialCatalog(warehouseDir) {
+        val table = "test_cat.db.geo_mor_delete"
+        try {
+          spark.sql(
+            s"CREATE TABLE $table (id BIGINT, geom GEOMETRY(4326), geog GEOGRAPHY(4326)) " +
+              "USING iceberg TBLPROPERTIES ('format-version' = '3', " +
+              "'write.delete.mode' = 'merge-on-read')")
+          // COALESCE(1) puts both rows in one data file, so the delete leaves a survivor there and
+          // Iceberg writes a deletion vector instead of dropping the whole file.
+          spark.sql(s"""
+            INSERT INTO $table SELECT /*+ COALESCE(1) */ id,
+              CASE WHEN geom_wkb IS NULL THEN NULL
+                   ELSE st_setsrid(st_geomfromwkb(geom_wkb), 4326) END,
+              CASE WHEN geog_wkb IS NULL THEN NULL
+                   ELSE st_setsrid(st_geogfromwkb(geog_wkb), 4326) END
+            FROM VALUES (1, X'$geomWkb', X'$geogWkb'), (2, X'$otherWkb', CAST(NULL AS BINARY))
+              AS v(id, geom_wkb, geog_wkb)
+          """)
+
+          spark.sql(s"DELETE FROM $table WHERE id = 1")
+
+          // Select the delete snapshot by operation rather than by commit time, whose millisecond
+          // granularity could tie with the insert snapshot.
+          val addedDvs = spark
+            .sql(s"SELECT summary['added-dvs'] FROM $table.snapshots WHERE operation = 'delete'")
+            .collect()
+            .map(_.getString(0))
+            .toSeq
+          assert(
+            addedDvs == Seq("1"),
+            s"expected the merge-on-read delete to add one deletion vector, got $addedDvs")
+
+          val projection =
+            s"SELECT id, hex(st_asbinary(geom)), hex(st_asbinary(geog)) FROM $table ORDER BY id"
+          checkIcebergNativeScanFallback(
+            projection,
+            "iceberg-rust cannot apply Puffin deletion vectors")
+          checkCometAnswer(spark.sql(projection), Seq(Row(2L, otherWkb, null)))
+        } finally {
+          spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
+        }
+      }
+    }
+  }
+
   test("partition evolution - _partition contains fields from all historical specs") {
     assume(icebergAvailable, "Iceberg not available in classpath")
 

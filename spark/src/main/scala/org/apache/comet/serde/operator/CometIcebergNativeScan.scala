@@ -45,8 +45,12 @@ import org.apache.comet.objectstore.NativeConfig
 import org.apache.comet.serde.{CometOperatorSerde, OperatorOuterClass}
 import org.apache.comet.serde.OperatorOuterClass.{Operator, SparkStructField}
 import org.apache.comet.serde.QueryPlanSerde.serializeDataType
+import org.apache.comet.shims.CometTypeShim
 
-object CometIcebergNativeScan extends CometOperatorSerde[CometBatchScanExec] with Logging {
+object CometIcebergNativeScan
+    extends CometOperatorSerde[CometBatchScanExec]
+    with CometTypeShim
+    with Logging {
 
   override def enabledConfig: Option[ConfigEntry[Boolean]] = None
 
@@ -842,6 +846,26 @@ object CometIcebergNativeScan extends CometOperatorSerde[CometBatchScanExec] wit
   }
 
   /**
+   * Required-schema field metadata key holding the Spark SRID of a v3 `geometry` / `geography`
+   * column, whose type is shipped to native as plain binary.
+   *
+   * The native side has no geospatial type. iceberg-rust hands such a column back as pure WKB in
+   * a binary Arrow array, while a Spark `GeometryVal` / `GeographyVal` is `[4-byte little-endian
+   * SRID | WKB]` -- the CRS lives on the Catalyst type, and the SRID that encodes it lives in
+   * every value. So native reads the column as binary and prepends this SRID (see
+   * `GEOSPATIAL_SRID_KEY` in `iceberg_scan.rs`), which makes the Arrow buffer hold Spark's
+   * physical layout and keeps every consumer of the batch, JVM or native, on the same bytes. Only
+   * the schema shipped to native is rewritten; the operator's Catalyst output keeps the
+   * geospatial types, so Spark still sees them.
+   *
+   * A geospatial type below the top level cannot be handled this way, because
+   * `SparkStructField.metadata` has no nested equivalent; `CometScanRule` falls the scan back
+   * instead, which is also what keeps `serializeDataType` -- which refuses geospatial types
+   * rather than approximating them -- from being asked about one.
+   */
+  val GEOSPATIAL_SRID_KEY = "comet.geospatial.srid"
+
+  /**
    * Serializes partitions from inputRDD at execution time.
    *
    * Called after doPrepare() has resolved DPP subqueries. Builds pools and per-partition data in
@@ -927,7 +951,14 @@ object CometIcebergNativeScan extends CometOperatorSerde[CometBatchScanExec] wit
         .newBuilder()
         .setName(attr.name)
         .setNullable(attr.nullable)
-      serializeDataType(attr.dataType).foreach(field.setDataType)
+      geospatialSrid(attr.dataType) match {
+        case Some(srid) =>
+          // Read as binary; native re-attaches the SRID header. See GEOSPATIAL_SRID_KEY.
+          serializeDataType(BinaryType).foreach(field.setDataType)
+          field.putMetadata(GEOSPATIAL_SRID_KEY, srid.toString)
+        case None =>
+          serializeDataType(attr.dataType).foreach(field.setDataType)
+      }
       commonBuilder.addRequiredSchema(field.build())
     }
 

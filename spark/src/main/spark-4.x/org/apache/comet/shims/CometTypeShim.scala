@@ -81,6 +81,37 @@ trait CometTypeShim {
   def isTimeType(dt: DataType): Boolean =
     dt.getClass.getSimpleName.startsWith("TimeType")
 
+  /**
+   * Spark 4.1's `GeometryType` / `GeographyType` (SPARK-52207). Matched by class name so the same
+   * shim compiles against Spark 4.0, where neither class exists. `ColumnVector.getGeometry`
+   * defaults to `GeometryVal.fromBytes(getBinary(i))`, so a binary Arrow array carries these
+   * types, provided the bytes are the physical layout rather than bare WKB (see
+   * [[geospatialSrid]]).
+   */
+  def isGeospatialType(dt: DataType): Boolean = dt.getClass.getSimpleName match {
+    case "GeometryType" | "GeographyType" => true
+    case _ => false
+  }
+
+  /**
+   * The SRID of a geospatial type, or `None` for any other type.
+   *
+   * A Spark `GeometryVal` / `GeographyVal` is `[4-byte little-endian SRID | WKB]`
+   * (`org.apache.spark.sql.catalyst.util.Geometry.fromWkb`), while Iceberg stores pure WKB and
+   * keeps the coordinate reference system on the column. Iceberg-Java's reader resolves the
+   * column's CRS to an SRID through Spark's CRS tables and attaches it per value; a native reader
+   * handing back Iceberg's bytes has to do the same, so it needs this number.
+   *
+   * Read reflectively for the same reason as [[isGeospatialType]]: the declaring classes are
+   * absent on Spark 4.0.
+   */
+  def geospatialSrid(dt: DataType): Option[Int] =
+    if (isGeospatialType(dt)) {
+      Some(dt.getClass.getMethod("srid").invoke(dt).asInstanceOf[Int])
+    } else {
+      None
+    }
+
   def isValidUtf8(s: UTF8String): Boolean = s.isValid
 
   def hasCollationSupport: Boolean = true

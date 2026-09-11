@@ -23,8 +23,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow::datatypes::SchemaRef;
+use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
@@ -60,6 +60,14 @@ use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile};
 /// neither errors at the stat layer, so without this floor the 0 would flow into the Parquet
 /// reader and surface as an opaque "file size of 0 is less than footer".
 const MIN_PARQUET_FILE_SIZE: u64 = 8;
+
+/// Metadata key on a required-schema field carrying the Spark SRID of a v3 `geometry` /
+/// `geography` column, which the JVM ships as a plain binary field (see
+/// `CometIcebergNativeScan.GEOSPATIAL_SRID_KEY`).
+const GEOSPATIAL_SRID_KEY: &str = "comet.geospatial.srid";
+
+/// Width of the SRID header Spark prefixes to a geospatial value's WKB.
+const SRID_HEADER_LEN: usize = 4;
 
 /// Iceberg table scan operator that uses iceberg-rust to read Iceberg tables.
 ///
@@ -237,6 +245,7 @@ impl IcebergScanExec {
 
         let wrapped_stream = IcebergStreamWrapper {
             inner: adapted_stream,
+            geospatial_headers: geospatial_srid_headers(&output_schema)?,
             schema: output_schema,
             adapter_factory,
             cached: None,
@@ -400,6 +409,9 @@ impl IcebergScanMetrics {
 struct IcebergStreamWrapper<S> {
     inner: S,
     schema: SchemaRef,
+    /// SRID headers to prepend to the geospatial columns of every batch, empty when the projection
+    /// has none. See [`geospatial_srid_headers`].
+    geospatial_headers: Vec<(usize, [u8; SRID_HEADER_LEN])>,
     /// Factory for creating adapters when file schema changes
     adapter_factory: SparkPhysicalExprAdapterFactory,
     /// Cached adapter and projection expressions for the current file schema,
@@ -463,7 +475,10 @@ where
                 let result = adapt_batch_with_expressions(batch, &self.schema, projection_exprs)
                     .map_err(|e| {
                         DataFusionError::Execution(format!("Batch adaptation failed: {}", e))
-                    });
+                    })
+                    // After adaptation, so the geospatial column is the target schema's Binary
+                    // rather than whatever width iceberg-rust produced.
+                    .and_then(|batch| prepend_srid_headers(batch, &self.geospatial_headers));
 
                 Poll::Ready(Some(result))
             }
@@ -532,6 +547,97 @@ impl fmt::Debug for RedactedProperties<'_> {
         }
         m.finish()
     }
+}
+
+/// The SRID header to prepend to each value of a geospatial column, by column index.
+///
+/// Iceberg stores a `geometry` / `geography` value as pure WKB and keeps the coordinate reference
+/// system on the column, while Spark's physical value is `[4-byte little-endian SRID | WKB]` (see
+/// `org.apache.spark.sql.catalyst.util.Geometry.fromWkb`). Iceberg-Java's reader resolves the CRS
+/// to an SRID and attaches it per value; the native reader does the same, using the SRID the JVM
+/// put in the field's metadata (resolving a CRS string ourselves would mean reimplementing Spark's
+/// CRS tables). Writing the header into the Arrow buffer -- rather than fixing it up as the JVM
+/// reads the vector -- keeps the column's bytes valid for every consumer of the batch.
+///
+/// Returns an empty vec for the common case of a schema with no geospatial column.
+fn geospatial_srid_headers(schema: &SchemaRef) -> DFResult<Vec<(usize, [u8; SRID_HEADER_LEN])>> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, field)| {
+            field.metadata().get(GEOSPATIAL_SRID_KEY).map(|srid| {
+                if field.data_type() != &DataType::Binary {
+                    return Err(DataFusionError::Execution(format!(
+                        "Geospatial column '{}' must be read as Binary, got {}",
+                        field.name(),
+                        field.data_type()
+                    )));
+                }
+                let srid: i32 = srid.parse().map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "Invalid {GEOSPATIAL_SRID_KEY} '{srid}' on column '{}'",
+                        field.name()
+                    ))
+                })?;
+                Ok((idx, srid.to_le_bytes()))
+            })
+        })
+        .collect()
+}
+
+/// Rewrites each geospatial column of `batch` with its SRID header prepended to every value.
+///
+/// Nulls stay null, and the batch's schema is unchanged: the column is binary before and after.
+fn prepend_srid_headers(
+    batch: RecordBatch,
+    headers: &[(usize, [u8; SRID_HEADER_LEN])],
+) -> DFResult<RecordBatch> {
+    if headers.is_empty() {
+        return Ok(batch);
+    }
+
+    let num_rows = batch.num_rows();
+    let schema = batch.schema();
+    let mut columns = batch.columns().to_vec();
+    // Reused across rows and columns so each value costs a memcpy, not an allocation.
+    let mut value = Vec::new();
+
+    for (idx, header) in headers {
+        let wkb = columns[*idx]
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Geospatial column '{}' is {}, expected Binary",
+                    schema.field(*idx).name(),
+                    columns[*idx].data_type()
+                ))
+            })?;
+        let mut builder = BinaryBuilder::with_capacity(
+            wkb.len(),
+            wkb.value_data().len() + SRID_HEADER_LEN * wkb.len(),
+        );
+        for row in 0..wkb.len() {
+            if wkb.is_null(row) {
+                builder.append_null();
+            } else {
+                value.clear();
+                value.extend_from_slice(header);
+                value.extend_from_slice(wkb.value(row));
+                builder.append_value(&value);
+            }
+        }
+        columns[*idx] = Arc::new(builder.finish());
+    }
+
+    // with_row_count so a batch of zero columns after projection still reports its rows; harmless
+    // here, where at least one column exists, but keeps the call total.
+    Ok(RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )?)
 }
 
 /// Build projection expressions that adapt batches from a file schema to the target schema.
@@ -698,6 +804,58 @@ mod tests {
         IcebergScanExec::fill_delete_file_sizes(&mut tasks, &fs_file_io(), 4)
             .await
             .unwrap();
+    }
+
+    // A geospatial column must reach the JVM as Spark's [SRID | WKB], with nulls preserved. 4326
+    // little-endian is E6 10 00 00.
+    #[test]
+    fn prepends_srid_header_to_geospatial_column() {
+        use arrow::array::{Array, BinaryArray, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::collections::HashMap;
+
+        let geom = Field::new("geom", DataType::Binary, true).with_metadata(HashMap::from([(
+            super::GEOSPATIAL_SRID_KEY.to_string(),
+            "4326".to_string(),
+        )]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geom,
+        ]));
+
+        let headers = super::geospatial_srid_headers(&schema).unwrap();
+        assert_eq!(headers, vec![(1, [0xE6, 0x10, 0x00, 0x00])]);
+
+        let wkb: &[u8] = &[0x01, 0x02, 0x03];
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(BinaryArray::from(vec![Some(wkb), None])),
+            ],
+        )
+        .unwrap();
+
+        let out = super::prepend_srid_headers(batch, &headers).unwrap();
+        let values = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), [0xE6, 0x10, 0x00, 0x00, 0x01, 0x02, 0x03]);
+        assert!(values.is_null(1));
+        // The unrelated column and the schema come through untouched.
+        assert_eq!(out.schema(), schema);
+        assert_eq!(out.num_rows(), 2);
+    }
+
+    // A schema without geospatial metadata must not pay for the rewrite.
+    #[test]
+    fn no_geospatial_metadata_means_no_headers() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        assert!(super::geospatial_srid_headers(&schema).unwrap().is_empty());
     }
 
     fn from_hex(s: &str) -> Vec<u8> {
