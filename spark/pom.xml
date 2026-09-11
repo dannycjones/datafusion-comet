@@ -257,14 +257,24 @@ under the License.
       </build>
     </profile>
 
-    <!-- Iceberg dependencies vary by Spark version (Iceberg 1.8.1 for Spark 3.x, 1.10.0 for Spark 4.0, 1.11.0 for Spark 4.1) -->
+    <!--
+      Iceberg dependencies vary by Spark version (Iceberg 1.8.1 for Spark 3.x, 1.10.0 for Spark 4.0,
+      1.11.0 for Spark 4.1). Each profile sets `iceberg.version` rather than hardcoding it in the
+      dependency so an unreleased build can be tested against without editing the pom, e.g.
+      `-Pspark-4.1 -Diceberg.version=1.12.0-SNAPSHOT` after `./gradlew publishToMavenLocal` in an
+      Iceberg checkout. Tests that need an unreleased Iceberg feature guard on
+      `CometIcebergTestBase.icebergVersionAtLeast`, so they simply skip on the pinned version.
+    -->
     <profile>
       <id>spark-3.4</id>
+      <properties>
+        <iceberg.version>1.5.2</iceberg.version>
+      </properties>
       <dependencies>
         <dependency>
           <groupId>org.apache.iceberg</groupId>
           <artifactId>iceberg-spark-runtime-${spark.version.short}_${scala.binary.version}</artifactId>
-          <version>1.5.2</version>
+          <version>${iceberg.version}</version>
           <scope>test</scope>
         </dependency>
         <!-- Jetty 9.4.x for Spark 3.4 (JDK 11, javax.* packages) -->
@@ -291,12 +301,13 @@ under the License.
       -->
       <properties>
         <delta.version>3.3.2</delta.version>
+        <iceberg.version>1.8.1</iceberg.version>
       </properties>
       <dependencies>
         <dependency>
           <groupId>org.apache.iceberg</groupId>
           <artifactId>iceberg-spark-runtime-${spark.version.short}_${scala.binary.version}</artifactId>
-          <version>1.8.1</version>
+          <version>${iceberg.version}</version>
           <scope>test</scope>
         </dependency>
         <!-- Jetty 9.4.x for Spark 3.5 (JDK 11, javax.* packages) -->
@@ -325,12 +336,13 @@ under the License.
           the 4.0.x line.
         -->
         <delta.version>4.0.0</delta.version>
+        <iceberg.version>1.10.0</iceberg.version>
       </properties>
       <dependencies>
         <dependency>
           <groupId>org.apache.iceberg</groupId>
           <artifactId>iceberg-spark-runtime-${spark.version.short}_${scala.binary.version}</artifactId>
-          <version>1.10.0</version>
+          <version>${iceberg.version}</version>
           <scope>test</scope>
         </dependency>
         <!-- Jetty 11.x for Spark 4.0 (jakarta.servlet) -->
@@ -356,12 +368,13 @@ under the License.
       <properties>
         <!-- Delta dep version (only used when `-Pcontrib-delta` is also active). -->
         <delta.version>4.1.0</delta.version>
+        <iceberg.version>1.11.0</iceberg.version>
       </properties>
       <dependencies>
         <dependency>
           <groupId>org.apache.iceberg</groupId>
           <artifactId>iceberg-spark-runtime-${spark.version.short}_${scala.binary.version}</artifactId>
-          <version>1.11.0</version>
+          <version>${iceberg.version}</version>
           <scope>test</scope>
         </dependency>
         <!-- Jetty 11.x for Spark 4.1 (jakarta.servlet); matches Spark 4.1.3's jetty.version -->
@@ -381,12 +394,15 @@ under the License.
     </profile>
     <profile>
       <id>spark-4.2</id>
+      <properties>
+        <iceberg.version>1.10.0</iceberg.version>
+      </properties>
       <dependencies>
         <!-- iceberg-spark-runtime-4.2 is not yet published; reuse the 4.0 runtime -->
         <dependency>
           <groupId>org.apache.iceberg</groupId>
           <artifactId>iceberg-spark-runtime-4.0_${scala.binary.version}</artifactId>
-          <version>1.10.0</version>
+          <version>${iceberg.version}</version>
           <scope>test</scope>
         </dependency>
         <!-- Jetty 11.x for Spark 4.2 (jakarta.servlet). Spark 4.2.0 itself ships Jetty 12, but
