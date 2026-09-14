@@ -20,6 +20,7 @@
 package org.apache.iceberg.rest;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
@@ -75,6 +76,19 @@ import org.apache.iceberg.util.PropertyUtil;
 /** Adaptor class to translate REST requests into {@link Catalog} API calls. */
 public class RESTCatalogAdapter implements RESTClient {
   private static final Splitter SLASH = Splitter.on('/');
+
+  // This file is vendored from Iceberg's own test fixtures but has to compile against every
+  // Iceberg version the Spark profiles pin (1.5.2 through 1.12), and the REST helpers it used
+  // moved in 1.11/1.12:
+  //
+  //   - RESTUtil.NAMESPACE_SPLITTER and RESTUtil.decodeNamespace(String) were removed in 1.12 in
+  //     favour of separator-taking overloads. The separator has always been the unit separator,
+  //     so splitting on it here needs no Iceberg API at all. RESTUtil.decodeString survives, so
+  //     per-level percent-decoding still goes through Iceberg.
+  //   - CatalogHandlers.loadTable(Catalog, TableIdentifier) gained a SnapshotMode parameter in
+  //     1.11 and lost the two-argument form in 1.12. SnapshotMode does not exist before 1.11, so
+  //     it cannot be named here; LOAD_TABLE dispatches reflectively instead.
+  private static final Splitter NAMESPACE_SPLITTER = Splitter.on('\u001F');
 
   private static final Map<Class<? extends Exception>, Integer> EXCEPTION_ERROR_CODES =
       ImmutableMap.<Class<? extends Exception>, Integer>builder()
@@ -320,9 +334,7 @@ public class RESTCatalogAdapter implements RESTClient {
           if (vars.containsKey("parent")) {
             ns =
                 Namespace.of(
-                    RESTUtil.NAMESPACE_SPLITTER
-                        .splitToStream(vars.get("parent"))
-                        .toArray(String[]::new));
+                    NAMESPACE_SPLITTER.splitToStream(vars.get("parent")).toArray(String[]::new));
           } else {
             ns = Namespace.empty();
           }
@@ -398,7 +410,7 @@ public class RESTCatalogAdapter implements RESTClient {
       case LOAD_TABLE:
         {
           TableIdentifier ident = identFromPathVars(vars);
-          return castResponse(responseType, CatalogHandlers.loadTable(catalog, ident));
+          return castResponse(responseType, loadTable(catalog, ident));
         }
 
       case REGISTER_TABLE:
@@ -672,8 +684,50 @@ public class RESTCatalogAdapter implements RESTClient {
         .withStackTrace(exc);
   }
 
+  /**
+   * Loads a table through {@code CatalogHandlers}, tolerating the {@code SnapshotMode} parameter
+   * Iceberg 1.11 added and 1.12 made mandatory. Requests {@code ALL} when the parameter is present,
+   * which is what the two-argument form did.
+   */
+  private static LoadTableResponse loadTable(Catalog catalog, TableIdentifier ident) {
+    try {
+      try {
+        return (LoadTableResponse)
+            CatalogHandlers.class
+                .getMethod("loadTable", Catalog.class, TableIdentifier.class)
+                .invoke(null, catalog, ident);
+      } catch (NoSuchMethodException e) {
+        Class<?> snapshotMode =
+            Class.forName("org.apache.iceberg.rest.RESTCatalogProperties$SnapshotMode");
+        Object all = snapshotMode.getMethod("valueOf", String.class).invoke(null, "ALL");
+        return (LoadTableResponse)
+            CatalogHandlers.class
+                .getMethod("loadTable", Catalog.class, TableIdentifier.class, snapshotMode)
+                .invoke(null, catalog, ident, all);
+      }
+    } catch (InvocationTargetException e) {
+      // Surface the handler's own exception; the caller maps these onto REST error codes.
+      Throwable cause = e.getCause();
+      if (cause instanceof RuntimeException) {
+        throw (RuntimeException) cause;
+      }
+      throw new RESTException(cause, "Failed to load table %s", ident);
+    } catch (ReflectiveOperationException e) {
+      throw new RESTException(e, "No usable CatalogHandlers.loadTable for %s", ident);
+    }
+  }
+
+  /**
+   * Percent-decodes each level of an encoded namespace path segment. Equivalent to the {@code
+   * RESTUtil.decodeNamespace(String)} that Iceberg 1.12 removed: split on the unit separator first,
+   * so a level containing an encoded separator survives.
+   */
   private static Namespace namespaceFromPathVars(Map<String, String> pathVars) {
-    return RESTUtil.decodeNamespace(pathVars.get("namespace"));
+    return Namespace.of(
+        NAMESPACE_SPLITTER
+            .splitToStream(pathVars.get("namespace"))
+            .map(RESTUtil::decodeString)
+            .toArray(String[]::new));
   }
 
   private static TableIdentifier identFromPathVars(Map<String, String> pathVars) {
