@@ -5527,7 +5527,7 @@ class CometIcebergNativeSuite
               s"(2, st_setsrid(st_geomfromwkb(X'$mercatorLineWkb'), 3857), " +
               s"st_setsrid(st_geomfromwkb(X'$lineWkb'), 4326), NULL)")
 
-          val projection = s"SELECT id, st_srid(mercator), st_srid(lonlat), st_srid(geog), " +
+          val projection = "SELECT id, st_srid(mercator), st_srid(lonlat), st_srid(geog), " +
             s"hex(st_asbinary(mercator)), hex(st_asbinary(lonlat)) FROM $table ORDER BY id"
           checkIcebergNativeScan(projection)
           checkCometAnswer(
@@ -5599,7 +5599,7 @@ class CometIcebergNativeSuite
               "USING iceberg TBLPROPERTIES ('format-version' = '3')")
           spark.sql(
             s"INSERT INTO $table VALUES " +
-              s"(1, named_struct('label', 'first', " +
+              "(1, named_struct('label', 'first', " +
               s"'geom', st_setsrid(st_geomfromwkb(X'$pointWkb'), 4326))), " +
               "(2, named_struct('label', 'no-geom', 'geom', NULL)), " +
               "(3, NULL)")
