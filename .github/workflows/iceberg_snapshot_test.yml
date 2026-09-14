@@ -47,6 +47,10 @@ on:
         required: true
         default: '1.12.0-SNAPSHOT'
 
+# Read-only: this job builds and tests, and never writes back to the repository.
+permissions:
+  contents: read
+
 env:
   RUST_VERSION: stable
   RUST_BACKTRACE: 1
