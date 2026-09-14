@@ -261,8 +261,10 @@ under the License.
       Iceberg dependencies vary by Spark version (Iceberg 1.8.1 for Spark 3.x, 1.10.0 for Spark 4.0,
       1.11.0 for Spark 4.1). Each profile sets `iceberg.version` rather than hardcoding it in the
       dependency so an unreleased build can be tested against without editing the pom, e.g.
-      `-Pspark-4.1 -Diceberg.version=1.12.0-SNAPSHOT` after `./gradlew publishToMavenLocal` in an
-      Iceberg checkout. Tests that need an unreleased Iceberg feature guard on
+      `-Pspark-4.1,iceberg-snapshots -Diceberg.version=1.12.0-SNAPSHOT` to pick up an Iceberg
+      nightly (see the `iceberg-snapshots` profile below), or the same override without that
+      profile to pick up a local `./gradlew publishToMavenLocal` from an Iceberg checkout.
+      Tests that need an unreleased Iceberg feature guard on
       `CometIcebergTestBase.icebergVersionAtLeast`, so they simply skip on the pinned version.
     -->
     <profile>
@@ -421,6 +423,64 @@ under the License.
           <scope>test</scope>
         </dependency>
       </dependencies>
+    </profile>
+    <!--
+      Resolves Iceberg from the ASF snapshot repository, for testing against an Iceberg release
+      that is not out yet. Pair with the version to use, e.g.
+      `-Pspark-4.1,iceberg-snapshots -Diceberg.version=1.12.0-SNAPSHOT`; on its own this profile
+      changes nothing, since every Spark profile pins a released `iceberg.version`.
+
+      Kept behind a profile rather than declared unconditionally so ordinary builds never reach
+      for snapshots. A snapshot is also a moving target: what resolves today is whatever Iceberg
+      main last published, so a job using this is inherently not reproducible and should not gate
+      anything.
+
+      As with contrib-delta, a Spark profile has to be named explicitly alongside this one:
+      passing any `-P` deactivates the activeByDefault Spark profile, which drops the test-scope
+      `iceberg-spark-runtime` and Jetty dependencies and breaks test compilation in ways whose
+      error messages point nowhere near the cause. An enforcer rule catches that.
+    -->
+    <profile>
+      <id>iceberg-snapshots</id>
+      <repositories>
+        <repository>
+          <id>apache-snapshots</id>
+          <name>Apache Snapshot Repository</name>
+          <url>https://repository.apache.org/snapshots</url>
+          <releases>
+            <enabled>false</enabled>
+          </releases>
+          <snapshots>
+            <enabled>true</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <version>${maven-enforcer-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>iceberg-snapshots-requires-spark-profile</id>
+                <goals>
+                  <goal>enforce</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <requireActiveProfile>
+                      <profiles>spark-3.4,spark-3.5,spark-4.0,spark-4.1,spark-4.2</profiles>
+                      <all>false</all>
+                      <message>-Piceberg-snapshots requires an explicit Spark profile, e.g. `-Pspark-4.1,iceberg-snapshots`. Activating any profile turns off the activeByDefault Spark profile, which drops test-scope dependencies (iceberg-spark-runtime, Jetty) and breaks test compilation.</message>
+                    </requireActiveProfile>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
     </profile>
     <!--
       Delta Lake integration. Activates the contrib/delta/ subtree:
