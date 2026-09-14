@@ -33,6 +33,7 @@ import org.apache.spark.CometListenerBusUtils
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 import org.apache.spark.sql.{CometTestBase, DataFrame, Row}
 import org.apache.spark.sql.catalyst.expressions.DynamicPruningExpression
+import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.comet._
 import org.apache.spark.sql.comet.execution.shuffle.CometShuffleExchangeExec
 import org.apache.spark.sql.execution.{InSubqueryExec, ReusedSubqueryExec, SparkPlan, SubqueryExec}
@@ -5447,8 +5448,11 @@ class CometIcebergNativeSuite
       withGeospatialCatalog(warehouseDir) {
         val table = "test_cat.db.geo_wkb"
         try {
-          // A bare GEOMETRY column is mixed-SRID, which Iceberg does not support, so pin the SRID
-          // to 4326 (OGC:CRS84). The geo types require format version 3.
+          // The SRID is part of the Spark type -- there is no bare `GEOMETRY` -- and 4326 is
+          // `OGC:CRS84`, which is also `Types.GeometryType.DEFAULT_CRS`, so these columns are the
+          // default-CRS case: nothing about the CRS appears in the DDL beyond the SRID itself. The
+          // test below covers a column whose CRS is not the default. The geo types require format
+          // version 3.
           spark.sql(
             s"CREATE TABLE $table (id BIGINT, geom GEOMETRY(4326), geog GEOGRAPHY(4326)) " +
               "USING iceberg TBLPROPERTIES ('format-version' = '3')")
@@ -5500,9 +5504,11 @@ class CometIcebergNativeSuite
   }
 
   // The read-back test above only proves the header is four bytes wide, because 4326 is also what a
-  // hardcoded or default SRID would be. This one puts a 3857 (Web Mercator) column beside a 4326 one
-  // in the same table and reads the header back through st_srid, so a header that ignores the
-  // column's own CRS -- or takes it from whichever geospatial column comes first -- fails here.
+  // hardcoded or default SRID would be: it is Iceberg's default CRS (OGC:CRS84) and Spark's
+  // GEOMETRY_DEFAULT_SRID. This one puts a 3857 (Web Mercator) column beside a 4326 one in the same
+  // table and reads both headers back through st_srid, so a header that ignores the column's own CRS
+  // -- or takes it from whichever geospatial column comes first -- fails here, while the default
+  // column in the same row still has to come back as 4326.
   test("each geospatial column carries its own SRID, not a default") {
     assumeGeospatialSupported()
     withTempIcebergDir { warehouseDir =>
@@ -5535,6 +5541,41 @@ class CometIcebergNativeSuite
           val single = s"SELECT st_srid(mercator) FROM $table ORDER BY id"
           checkIcebergNativeScan(single)
           checkCometAnswer(spark.sql(single), Seq(Row(3857), Row(3857)))
+        } finally {
+          spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
+        }
+      }
+    }
+  }
+
+  // The other direction of the test above: what happens when a column has no single SRID to
+  // prepend. Spark 4.1 can declare that -- `GEOMETRY(ANY)` is `srid = -1`, CRS `SRID:ANY` -- and
+  // CometScanRule falls back for it, since prepending -1 would write `FF FF FF FF` into every
+  // value. That fallback should be unreachable through Iceberg, because an Iceberg column carries
+  // exactly one CRS, and this pins the two reasons why: Iceberg's Spark type conversion rejects a
+  // mixed-SRID column outright, and an SRID-less `GEOMETRY` is not even parseable. If a later Spark
+  // or Iceberg starts accepting either, this fails rather than the fallback quietly becoming live
+  // code no test covers.
+  test("a geometry column with no single SRID cannot be created in an Iceberg table") {
+    assumeGeospatialSupported()
+    withTempIcebergDir { warehouseDir =>
+      withGeospatialCatalog(warehouseDir) {
+        val table = "test_cat.db.geo_mixed"
+        try {
+          val mixed = intercept[Exception] {
+            spark.sql(
+              s"CREATE TABLE $table (id BIGINT, geom GEOMETRY(ANY)) USING iceberg " +
+                "TBLPROPERTIES ('format-version' = '3')")
+          }
+          assert(
+            mixed.getMessage != null && mixed.getMessage.contains("mixed SRID"),
+            s"expected Iceberg to reject a mixed-SRID column, got: $mixed")
+          // Spark's grammar has no bare `GEOMETRY`: the SRID (or ANY) is part of the type.
+          intercept[ParseException] {
+            spark.sql(
+              s"CREATE TABLE $table (id BIGINT, geom GEOMETRY) USING iceberg " +
+                "TBLPROPERTIES ('format-version' = '3')")
+          }
         } finally {
           spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
         }

@@ -102,7 +102,7 @@ jobs:
         env:
           # Every geospatial test names one of geometry / geography / geospatial. Bump when adding
           # one; the count is here so deleting a test is a deliberate act rather than a quiet loss.
-          EXPECTED_GEO_TESTS: "5"
+          EXPECTED_GEO_TESTS: "6"
         run: |
           set -euo pipefail
           report=$(find . -name 'TEST-org.apache.comet.CometIcebergNativeSuite.xml' | head -1)

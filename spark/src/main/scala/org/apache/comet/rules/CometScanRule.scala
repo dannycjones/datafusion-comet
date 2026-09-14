@@ -470,7 +470,20 @@ case class CometScanRule(session: SparkSession)
               dt: DataType,
               name: String,
               reasons: ListBuffer[String]): Boolean = dt match {
-            case _ if isGeospatialType(dt) => true
+            // A mixed-SRID column (Spark's `GEOMETRY(ANY)`, `srid = -1`) has no single header to
+            // prepend, and writing -1 would corrupt every value rather than fail. Iceberg keeps one
+            // CRS per column and its Spark type conversion rejects mixed SRID at CREATE TABLE, so
+            // this is defence in depth against a schema that says otherwise -- see the "no single
+            // SRID" test in CometIcebergNativeSuite.
+            case _ if isGeospatialType(dt) =>
+              val srid = geospatialSrid(dt)
+              if (srid.exists(_ >= 0)) {
+                true
+              } else {
+                reasons += "Unsupported Iceberg native scan type: geospatial column without a " +
+                  s"single SRID ($name)"
+                false
+              }
             case _ if containsGeospatialType(dt) =>
               reasons += "Unsupported Iceberg native scan type: geospatial type nested inside " +
                 s"a struct, array, or map ($name)"
