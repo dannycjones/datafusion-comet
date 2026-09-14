@@ -5382,12 +5382,35 @@ class CometIcebergNativeSuite
     }
   }
 
-  // WKB (little-endian) for POINT(30 10), POINT(-71 42) and POINT(100 50). Uppercase because `hex`
-  // returns uppercase and `X'..'` literals are case-insensitive, so the same constant serves as
-  // both the written value and the expected read-back. Matches Iceberg's own TestSparkGeospatial.
-  private val geomWkb = "01010000000000000000003E400000000000002440"
-  private val geogWkb = "01010000000000000000C051C00000000000004540"
-  private val otherWkb = "010100000000000000000059400000000000004940"
+  // WKB (little-endian) fixtures, uppercase because `hex` returns uppercase and `X'..'` literals are
+  // case-insensitive, so one constant serves as both the written value and the expected read-back.
+  // The two points match Iceberg's own TestSparkGeospatial. The other geometry types are here
+  // because the native scan rebuilds the binary array's offsets when it prepends SRID headers, and
+  // a fixture set whose every value is 21 bytes long cannot tell correct offset arithmetic from a
+  // fixed stride; lengths below run 21 to 93 bytes.
+  private val pointWkb = "01010000000000000000003E400000000000002440" // POINT(30 10)
+  // LINESTRING(30 10, 10 30, 40 40)
+  private val lineWkb =
+    "0102000000030000000000000000003E40000000000000244000000000000024400000000000003E40" +
+      "00000000000044400000000000004440"
+  // POLYGON((30 10, 40 40, 20 40, 10 20, 30 10))
+  private val polygonWkb =
+    "010300000001000000050000000000000000003E4000000000000024400000000000004440000000000000" +
+      "44400000000000003440000000000000444000000000000024400000000000003440000000000000" +
+      "3E400000000000002440"
+  // MULTIPOINT((10 40), (40 30), (20 20))
+  private val multiPointWkb =
+    "010400000003000000010100000000000000000024400000000000004440010100000000000000000044" +
+      "400000000000003E40010100000000000000000034400000000000003440"
+  // Geographic coordinates, for the GEOGRAPHY columns: POINT(-71 42) and LINESTRING(-71 42, -70 43).
+  private val geogPointWkb = "01010000000000000000C051C00000000000004540"
+  private val geogLineWkb =
+    "0102000000020000000000000000C051C0000000000000454000000000008051C00000000000804540"
+  // Web Mercator (SRID 3857) metres, for the column whose CRS is not 4326:
+  // POINT(3339584.72 1118889.97) and LINESTRING(3339584.72 1118889.97, 4452779.63 4865942.28).
+  private val mercatorPointWkb = "0101000000C3F5285CA07A494185EB51F8A9123141"
+  private val mercatorLineWkb =
+    "010200000002000000C3F5285CA07A494185EB51F8A912314185EB51E86AFC50411F85EB91E58F5241"
 
   /** Catalog + geospatial confs shared by the geometry/geography tests. */
   private def withGeospatialCatalog(warehouseDir: File)(f: => Unit): Unit =
@@ -5431,12 +5454,19 @@ class CometIcebergNativeSuite
               "USING iceberg TBLPROPERTIES ('format-version' = '3')")
           // st_geomfromwkb yields SRID 0, so set it to the column's SRID for the write to be
           // accepted.
+          // Mixed geometry types, so the values have mixed lengths: the header prefixing has to
+          // rebuild every offset, and equal-length values would hide an off-by-one there. Row 3
+          // holds the longest value with a null beside it, row 5 is null throughout.
           spark.sql(
             s"INSERT INTO $table VALUES " +
-              s"(1, st_setsrid(st_geomfromwkb(X'$geomWkb'), 4326), " +
-              s"st_setsrid(st_geogfromwkb(X'$geogWkb'), 4326)), " +
-              s"(2, st_setsrid(st_geomfromwkb(X'$otherWkb'), 4326), NULL), " +
-              "(3, NULL, NULL)")
+              s"(1, st_setsrid(st_geomfromwkb(X'$pointWkb'), 4326), " +
+              s"st_setsrid(st_geogfromwkb(X'$geogPointWkb'), 4326)), " +
+              s"(2, st_setsrid(st_geomfromwkb(X'$lineWkb'), 4326), " +
+              s"st_setsrid(st_geogfromwkb(X'$geogLineWkb'), 4326)), " +
+              s"(3, st_setsrid(st_geomfromwkb(X'$polygonWkb'), 4326), NULL), " +
+              s"(4, st_setsrid(st_geomfromwkb(X'$multiPointWkb'), 4326), " +
+              s"st_setsrid(st_geogfromwkb(X'$geogPointWkb'), 4326)), " +
+              "(5, NULL, NULL)")
 
           // st_asbinary strips the SRID header back to the bytes that were written.
           val projection =
@@ -5445,7 +5475,12 @@ class CometIcebergNativeSuite
           // Spark parity alone would pass if both engines returned all nulls, so pin the values.
           checkCometAnswer(
             spark.sql(projection),
-            Seq(Row(1L, geomWkb, geogWkb), Row(2L, otherWkb, null), Row(3L, null, null)))
+            Seq(
+              Row(1L, pointWkb, geogPointWkb),
+              Row(2L, lineWkb, geogLineWkb),
+              Row(3L, polygonWkb, null),
+              Row(4L, multiPointWkb, geogPointWkb),
+              Row(5L, null, null)))
 
           // Spark 4.1 has no spatial predicates, but IS [NOT] NULL is expressible, and Iceberg
           // pushes it down as a residual. iceberg-rust's page-index evaluator decodes BYTE_ARRAY
@@ -5457,6 +5492,49 @@ class CometIcebergNativeSuite
           // Pruning the geo columns away must not change the plan, and a filter on a non-geo
           // column still pushes down normally.
           checkIcebergNativeScan(s"SELECT id FROM $table WHERE id > 1 ORDER BY id")
+        } finally {
+          spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
+        }
+      }
+    }
+  }
+
+  // The read-back test above only proves the header is four bytes wide, because 4326 is also what a
+  // hardcoded or default SRID would be. This one puts a 3857 (Web Mercator) column beside a 4326 one
+  // in the same table and reads the header back through st_srid, so a header that ignores the
+  // column's own CRS -- or takes it from whichever geospatial column comes first -- fails here.
+  test("each geospatial column carries its own SRID, not a default") {
+    assumeGeospatialSupported()
+    withTempIcebergDir { warehouseDir =>
+      withGeospatialCatalog(warehouseDir) {
+        val table = "test_cat.db.geo_srid"
+        try {
+          // GEOGRAPHY is restricted to geographic CRSs, so only the GEOMETRY columns can differ.
+          spark.sql(
+            s"CREATE TABLE $table (id BIGINT, mercator GEOMETRY(3857), lonlat GEOMETRY(4326), " +
+              "geog GEOGRAPHY(4326)) USING iceberg TBLPROPERTIES ('format-version' = '3')")
+          spark.sql(
+            s"INSERT INTO $table VALUES " +
+              s"(1, st_setsrid(st_geomfromwkb(X'$mercatorPointWkb'), 3857), " +
+              s"st_setsrid(st_geomfromwkb(X'$pointWkb'), 4326), " +
+              s"st_setsrid(st_geogfromwkb(X'$geogPointWkb'), 4326)), " +
+              s"(2, st_setsrid(st_geomfromwkb(X'$mercatorLineWkb'), 3857), " +
+              s"st_setsrid(st_geomfromwkb(X'$lineWkb'), 4326), NULL)")
+
+          val projection = s"SELECT id, st_srid(mercator), st_srid(lonlat), st_srid(geog), " +
+            s"hex(st_asbinary(mercator)), hex(st_asbinary(lonlat)) FROM $table ORDER BY id"
+          checkIcebergNativeScan(projection)
+          checkCometAnswer(
+            spark.sql(projection),
+            Seq(
+              Row(1L, 3857, 4326, 4326, mercatorPointWkb, pointWkb),
+              Row(2L, 3857, 4326, null, mercatorLineWkb, lineWkb)))
+
+          // Projecting the 3857 column on its own leaves it at a different schema position, which a
+          // header keyed off the field index rather than the field itself would get wrong.
+          val single = s"SELECT st_srid(mercator) FROM $table ORDER BY id"
+          checkIcebergNativeScan(single)
+          checkCometAnswer(spark.sql(single), Seq(Row(3857), Row(3857)))
         } finally {
           spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
         }
@@ -5481,7 +5559,7 @@ class CometIcebergNativeSuite
           spark.sql(
             s"INSERT INTO $table VALUES " +
               s"(1, named_struct('label', 'first', " +
-              s"'geom', st_setsrid(st_geomfromwkb(X'$geomWkb'), 4326))), " +
+              s"'geom', st_setsrid(st_geomfromwkb(X'$pointWkb'), 4326))), " +
               "(2, named_struct('label', 'no-geom', 'geom', NULL)), " +
               "(3, NULL)")
 
@@ -5493,7 +5571,7 @@ class CometIcebergNativeSuite
           // Spark parity is asserted above; pin the values so an all-null answer cannot pass.
           checkAnswer(
             spark.sql(projection),
-            Seq(Row(1L, "first", geomWkb), Row(2L, "no-geom", null), Row(3L, null, null)))
+            Seq(Row(1L, "first", pointWkb), Row(2L, "no-geom", null), Row(3L, null, null)))
 
           // Reading the non-geo sibling still reads the whole struct, so it falls back too.
           checkIcebergNativeScanFallback(
@@ -5527,9 +5605,9 @@ class CometIcebergNativeSuite
               "'write.delete.mode' = 'copy-on-write')")
           spark.sql(
             s"INSERT INTO $table VALUES " +
-              s"(1, st_setsrid(st_geomfromwkb(X'$geomWkb'), 4326), " +
-              s"st_setsrid(st_geogfromwkb(X'$geogWkb'), 4326)), " +
-              s"(2, st_setsrid(st_geomfromwkb(X'$otherWkb'), 4326), NULL)")
+              s"(1, st_setsrid(st_geomfromwkb(X'$pointWkb'), 4326), " +
+              s"st_setsrid(st_geogfromwkb(X'$geogPointWkb'), 4326)), " +
+              s"(2, st_setsrid(st_geomfromwkb(X'$polygonWkb'), 4326), NULL)")
 
           // Spark has no spatial predicate, so filter on id.
           spark.sql(s"DELETE FROM $table WHERE id = 1")
@@ -5537,7 +5615,7 @@ class CometIcebergNativeSuite
           val projection =
             s"SELECT id, hex(st_asbinary(geom)), hex(st_asbinary(geog)) FROM $table ORDER BY id"
           checkIcebergNativeScan(projection)
-          checkCometAnswer(spark.sql(projection), Seq(Row(2L, otherWkb, null)))
+          checkCometAnswer(spark.sql(projection), Seq(Row(2L, polygonWkb, null)))
         } finally {
           spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
         }
@@ -5568,7 +5646,7 @@ class CometIcebergNativeSuite
                    ELSE st_setsrid(st_geomfromwkb(geom_wkb), 4326) END,
               CASE WHEN geog_wkb IS NULL THEN NULL
                    ELSE st_setsrid(st_geogfromwkb(geog_wkb), 4326) END
-            FROM VALUES (1, X'$geomWkb', X'$geogWkb'), (2, X'$otherWkb', CAST(NULL AS BINARY))
+            FROM VALUES (1, X'$pointWkb', X'$geogPointWkb'), (2, X'$polygonWkb', CAST(NULL AS BINARY))
               AS v(id, geom_wkb, geog_wkb)
           """)
 
@@ -5590,7 +5668,7 @@ class CometIcebergNativeSuite
           checkIcebergNativeScanFallback(
             projection,
             "iceberg-rust cannot apply Puffin deletion vectors")
-          checkCometAnswer(spark.sql(projection), Seq(Row(2L, otherWkb, null)))
+          checkCometAnswer(spark.sql(projection), Seq(Row(2L, polygonWkb, null)))
         } finally {
           spark.sql(s"DROP TABLE IF EXISTS $table PURGE")
         }
