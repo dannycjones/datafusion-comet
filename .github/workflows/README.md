@@ -101,15 +101,16 @@ Two rules keep those runs from corrupting the PR's status:
 These workflows have their own triggers because they fire on events the
 umbrella doesn't watch, or operate independently of the rest of CI:
 
-| File                   | Why standalone                                                                                       |
-| ---------------------- | ---------------------------------------------------------------------------------------------------- |
-| `pr_title_check.yml`   | Fires on `pull_request.types: [edited]` so it re-runs when a PR title is edited without a code push. |
-| `codeql.yml`           | Security scanner; weekly schedule + on every push/PR.                                                |
-| `miri.yml`             | Nightly Miri safety checks.                                                                          |
-| `stale.yml`            | Daily stale-PR closer.                                                                               |
-| `take.yml`             | Issue-comment trigger for `take` / `untake`.                                                         |
-| `label_new_issues.yml` | Issue trigger to apply `requires-triage`.                                                            |
-| `label_prs.yml`        | Runs on `pull_request_target` so it can label pull requests opened from forks.                       |
+| File                        | Why standalone                                                                                                                                                                   |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pr_title_check.yml`        | Fires on `pull_request.types: [edited]` so it re-runs when a PR title is edited without a code push.                                                                             |
+| `codeql.yml`                | Security scanner; weekly schedule + on every push/PR.                                                                                                                            |
+| `miri.yml`                  | Nightly Miri safety checks.                                                                                                                                                      |
+| `stale.yml`                 | Daily stale-PR closer.                                                                                                                                                           |
+| `take.yml`                  | Issue-comment trigger for `take` / `untake`.                                                                                                                                     |
+| `label_new_issues.yml`      | Issue trigger to apply `requires-triage`.                                                                                                                                        |
+| `label_prs.yml`             | Runs on `pull_request_target` so it can label pull requests opened from forks.                                                                                                   |
+| `iceberg_snapshot_test.yml` | Nightly + manual. Runs the Iceberg native-scan suites against an Iceberg snapshot, so tests gated on an unreleased Iceberg run somewhere. Non-gating: a snapshot moves under us. |
 
 ## Reusable workflows (called by `ci.yml`)
 

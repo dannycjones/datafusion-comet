@@ -457,7 +457,40 @@ case class CometScanRule(session: SparkSession)
           return withFallbackReasons(scanExec, fallbackReasons.toSet)
         }
 
-        val typeChecker = CometScanTypeChecker()
+        // iceberg-rust materializes V3 `geometry` / `geography` as WKB in a binary Arrow array.
+        // Spark's physical value is `[4-byte little-endian SRID | WKB]`, so the native scan reads
+        // the column as binary and prepends the column's SRID, which travels to native as
+        // required-schema field metadata (see CometIcebergNativeScan.GEOSPATIAL_SRID_KEY). That
+        // metadata has no slot for a field below the top level, hence the second case: a struct,
+        // array, or map containing a geospatial type falls back rather than silently reading WKB
+        // that is missing its header. No other Comet operator handles the types, so anything
+        // downstream that cannot take a geospatial column falls back on its own gate.
+        val typeChecker = new CometScanTypeChecker() {
+          override def isTypeSupported(
+              dt: DataType,
+              name: String,
+              reasons: ListBuffer[String]): Boolean = dt match {
+            // A mixed-SRID column (Spark's `GEOMETRY(ANY)`, `srid = -1`) has no single header to
+            // prepend, and writing -1 would corrupt every value rather than fail. Iceberg keeps one
+            // CRS per column and its Spark type conversion rejects mixed SRID at CREATE TABLE, so
+            // this is defence in depth against a schema that says otherwise -- see the "no single
+            // SRID" test in CometIcebergNativeSuite.
+            case _ if isGeospatialType(dt) =>
+              val srid = geospatialSrid(dt)
+              if (srid.exists(_ >= 0)) {
+                true
+              } else {
+                reasons += "Unsupported Iceberg native scan type: geospatial column without a " +
+                  s"single SRID ($name)"
+                false
+              }
+            case _ if containsGeospatialType(dt) =>
+              reasons += "Unsupported Iceberg native scan type: geospatial type nested inside " +
+                s"a struct, array, or map ($name)"
+              false
+            case _ => super.isTypeSupported(dt, name, reasons)
+          }
+        }
         // Filter out metadata columns from schema check -- their types are handled
         // by iceberg-rust directly (e.g., _partition can be an empty struct for
         // unpartitioned tables which the general type checker rejects).
@@ -646,8 +679,8 @@ case class CometScanRule(session: SparkSession)
 
         // Check Iceberg table format version
 
-        // V3 adds column types iceberg-rust cannot read (variant, geometry, geography, unknown)
-        // and column default values; those are handled by the allow-list and default-value checks
+        // V3 adds column types iceberg-rust cannot read (variant, unknown) and column default
+        // values; those are handled by the allow-list and default-value checks
         // below, which fall back per-table. This gate only bounds the format version. Deletion
         // vectors (a V3 delete feature) are handled by the delete-file gate, which still falls back
         // for non-Parquet (Puffin) deletes since native deletion-vector reads are not yet wired.
@@ -711,7 +744,8 @@ case class CometScanRule(session: SparkSession)
                   dt: DataType,
                   name: String,
                   reasons: ListBuffer[String]): Boolean =
-                isVariantType(dt) || super.isTypeSupported(dt, name, reasons)
+                isVariantType(dt) || isGeospatialType(dt) ||
+                  super.isTypeSupported(dt, name, reasons)
             }
             val resolver = session.sessionState.conf.resolver
             val tableFieldIds = IcebergReflection.buildFieldIdMapping(metadata.tableSchema)
@@ -949,13 +983,18 @@ case class CometScanRule(session: SparkSession)
                     }
                     fieldInfo match {
                       case Some((fieldName, fieldType)) =>
+                        // Geometry/geography are read natively as WKB, but comparing a WKB blob for
+                        // equality is not the spatial equality Iceberg's Datum would have to
+                        // implement, so keep geospatial keys on Spark alongside struct and Variant.
                         if (fieldType.contains("struct") || fieldType.equalsIgnoreCase(
-                            "variant")) {
+                            "variant") ||
+                          fieldType.startsWith("geometry(") ||
+                          fieldType.startsWith("geography(")) {
                           hasUnsupportedDeletes = true
                           fallbackReasons +=
                             s"Equality delete on unsupported column type '$fieldName' " +
                               s"($fieldType) is not yet supported by iceberg-rust. " +
-                              "Struct and Variant types in equality deletes " +
+                              "Struct, Variant, and geospatial types in equality deletes " +
                               "require datum conversion support that is not yet implemented."
                         }
                       case None =>
@@ -1043,6 +1082,18 @@ case class CometScanRule(session: SparkSession)
 
   private def isDynamicPruningFilter(e: Expression): Boolean =
     e.exists(_.isInstanceOf[PlanExpression[_]])
+
+  /** True when `dt` holds a geospatial type somewhere below its own top level. */
+  private def containsGeospatialType(dt: DataType): Boolean = dt match {
+    case s: StructType =>
+      s.exists(f => isGeospatialType(f.dataType) || containsGeospatialType(f.dataType))
+    case a: ArrayType =>
+      isGeospatialType(a.elementType) || containsGeospatialType(a.elementType)
+    case m: MapType =>
+      isGeospatialType(m.keyType) || containsGeospatialType(m.keyType) ||
+      isGeospatialType(m.valueType) || containsGeospatialType(m.valueType)
+    case _ => false
+  }
 
   /**
    * Detects AQE DPP (SubqueryAdaptiveBroadcastExec), as opposed to non-AQE DPP.

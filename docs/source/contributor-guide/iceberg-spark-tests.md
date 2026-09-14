@@ -130,3 +130,26 @@ and failure propagation. The fixture does not compile Spark or Iceberg.
 Apply the `run-iceberg-tests` label to a pull request whenever it touches reflection code
 (`org.apache.comet.iceberg.IcebergReflection`) or other logic whose behavior can differ across Iceberg
 versions, since Iceberg 1.11 alone will not catch a regression that only affects 1.8, 1.9, or 1.10.
+
+## Testing Against an Unreleased Iceberg
+
+Comet's own Scala suites run against the Iceberg release each Spark profile pins (`iceberg.version` in
+`spark/pom.xml`). Some support lands here before the Iceberg release that carries it — v3 geospatial
+types need Iceberg 1.12's Spark `GEOMETRY`/`GEOGRAPHY` mapping, for example. Tests for those guard on
+`CometIcebergTestBase.icebergVersionAtLeast` and skip on the pinned version, so they need an explicit
+run against a newer Iceberg:
+
+```shell
+./mvnw -Pspark-4.1,iceberg-snapshots -Diceberg.version=1.12.0-SNAPSHOT \
+  -Dsuites=org.apache.comet.CometIcebergNativeSuite test
+```
+
+`-Piceberg-snapshots` only adds the ASF snapshot repository; the version still has to be named. Naming
+the Spark profile is mandatory, since activating any profile turns off the `activeByDefault` one. To
+test an Iceberg you built yourself, `./gradlew publishToMavenLocal` in the Iceberg checkout and drop
+`-Piceberg-snapshots`.
+
+`iceberg_snapshot_test.yml` runs this nightly and on manual dispatch, and fails if the geospatial
+tests skipped — a green run that skipped everything it exists to check is worse than a red one. It is
+deliberately not a required check: a snapshot is a moving target, so a failure there can mean Iceberg
+main changed rather than that a pull request is wrong.

@@ -168,15 +168,28 @@ The following scenarios will fall back to the JVM Iceberg reader:
 
 - Iceberg table spec v4 or newer
 - v3 tables with columns that declare an initial default value
-- v3 column types the native reader cannot read (`variant`, `geometry`, `geography`, `unknown`)
+- v3 column types the native reader cannot read (`variant`, `unknown`)
+- Equality deletes keyed on a `struct`, `variant`, `geometry`, or `geography` column
 - Encrypted tables with 192-bit data keys (no AES-192-GCM in the underlying crypto)
 - Deletion vectors (v3 Puffin deletes); positional and equality deletes in Parquet are supported
 - Iceberg writes (reads are accelerated, writes use Spark)
 - Tables backed by Avro or ORC data files (only Parquet is accelerated)
-- Tables partitioned on `BINARY` or `DECIMAL` (with precision >28) columns
+- Tables partitioned on `BINARY`, `GEOMETRY`, `GEOGRAPHY`, or `DECIMAL` (with precision >28) columns
 - Scans with residual filters using `truncate`, `bucket`, `year`, `month`, `day`, or `hour`
   transform functions (partition pruning still works, but row-level filtering of these
   transforms falls back)
+- Scans that project a `struct`, `array`, or `map` column containing a `geometry` or `geography`
+  field (top-level geospatial columns are read natively; the scan projects whole top-level columns,
+  so reading any part of such a struct falls back, while leaving it out of the query does not)
+
+v3 `geometry` and `geography` columns are read natively when they are top-level columns. Iceberg
+stores pure WKB and keeps the CRS on the column, whereas a Spark geospatial value is physically
+`[4-byte little-endian SRID | WKB]`. The native scan therefore reads iceberg-rust's binary Arrow
+array and prepends the column's SRID, which the JVM ships to native as field metadata on the
+required schema. That metadata channel has no per-nested-field slot, which is why a geospatial
+field below the top level falls back instead. Residual filters over a geospatial column, including
+the `IS NOT NULL` Iceberg adds for any filtered column, are not pushed to native, so the scan stays
+native and Spark applies the filter instead.
 
 ### Iceberg UDFs
 

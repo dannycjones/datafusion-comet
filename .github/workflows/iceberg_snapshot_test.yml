@@ -1,0 +1,125 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Runs the Iceberg native-scan suites against an unreleased Iceberg build from
+# the ASF snapshot repository, rather than the release each Spark profile pins.
+#
+# Why this exists: some Iceberg features land in Comet before the Iceberg
+# release that carries them. The tests that need one guard on
+# `CometIcebergTestBase.icebergVersionAtLeast`, so on the pinned release they
+# skip and the standard PR build proves only the absence of regressions. This
+# workflow is where they actually run. Today that means the v3 geospatial tests,
+# which need the Spark GEOMETRY/GEOGRAPHY mapping added in Iceberg 1.12.
+#
+# Deliberately kept out of ci.yml and off the required-check list: a snapshot is
+# a moving target, so a failure here can mean "Iceberg main changed today" as
+# easily as "this PR is wrong", and that is not a reasonable thing to block a
+# merge on. Read it as a signal, not a gate.
+#
+# Triggers: nightly on the default branch, plus manual dispatch (pick the
+# snapshot version). Run it by hand on a branch that touches the Iceberg scan.
+
+name: Iceberg Snapshot Tests (non-gating)
+
+on:
+  schedule:
+    # 05:00 UTC, a few hours after Iceberg's nightly publish.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      iceberg-version:
+        description: 'Iceberg version to resolve from the ASF snapshot repository'
+        type: string
+        required: true
+        default: '1.12.0-SNAPSHOT'
+
+# Read-only: this job builds and tests, and never writes back to the repository.
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: stable
+  RUST_BACKTRACE: 1
+  # Force GNU ld on Linux: recent Rust stable defaults to rust-lld on
+  # x86_64-unknown-linux-gnu, and rust-lld cannot resolve -ljvm against the
+  # Zulu JDK layout installed by setup-java. Keep bfd for all cargo invocations.
+  RUSTFLAGS: "-Clink-arg=-fuse-ld=bfd"
+
+jobs:
+  iceberg-snapshot-test:
+    name: iceberg-snapshot/spark-4.1
+    runs-on: ubuntu-24.04
+    container:
+      image: amd64/rust
+    timeout-minutes: 90
+    env:
+      # Snapshots only exist for the Iceberg version currently in development,
+      # which supports the newest Spark line, so this lane is spark-4.1 only.
+      ICEBERG_VERSION: ${{ inputs.iceberg-version || '1.12.0-SNAPSHOT' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust & Java toolchain
+        uses: ./.github/actions/setup-builder
+        with:
+          rust-version: ${{ env.RUST_VERSION }}
+          jdk-version: "17"
+
+      - name: Java test steps
+        uses: ./.github/actions/java-test
+        with:
+          artifact_name: iceberg-snapshot-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}
+          suites: |
+            org.apache.comet.CometIcebergNativeSuite
+            org.apache.comet.CometIcebergWriteDetectionSuite
+          # -Piceberg-snapshots only adds the snapshot repository; the version
+          # still has to be asked for explicitly. The Spark profile has to be
+          # named because activating any profile turns off the activeByDefault
+          # one (an enforcer rule in spark/pom.xml explains this if forgotten).
+          maven_opts: -Pspark-4.1,iceberg-snapshots -Diceberg.version=${{ inputs.iceberg-version || '1.12.0-SNAPSHOT' }}
+          upload-test-reports: true
+
+      # Without this the job's whole purpose can quietly evaporate: if the
+      # snapshot stops satisfying icebergVersionAtLeast (say the version on
+      # Iceberg main moves on, or geo support is reworked), every geospatial
+      # test cancels itself and the run still goes green.
+      - name: Fail if geospatial tests were skipped
+        shell: bash
+        env:
+          # Every geospatial test names one of geometry / geography / geospatial. Bump when adding
+          # one; the count is here so deleting a test is a deliberate act rather than a quiet loss.
+          EXPECTED_GEO_TESTS: "6"
+        run: |
+          set -euo pipefail
+          report=$(find . -name 'TEST-org.apache.comet.CometIcebergNativeSuite.xml' | head -1)
+          if [ -z "$report" ]; then
+            echo "::error::No CometIcebergNativeSuite report found; cannot tell whether the geospatial tests ran."
+            exit 1
+          fi
+          # ScalaTest's JUnit writer wraps attributes across lines and records a canceled test as a
+          # <testcase> with a <skipped/> child, so flatten the file before matching either.
+          cases=$(tr '\n' ' ' < "$report" \
+            | grep -oE '<testcase[^>]*>[[:space:]]*(<skipped/>)?' \
+            | grep -iE 'geometry|geography|geospatial' || true)
+          ran=$(printf '%s' "$cases" | grep -c '<testcase' || true)
+          skipped=$(printf '%s' "$cases" | grep -c '<skipped/>' || true)
+          if [ "$skipped" -ne 0 ] || [ "$ran" -lt "$EXPECTED_GEO_TESTS" ]; then
+            echo "::error::Geospatial tests did not run against Iceberg $ICEBERG_VERSION ($ran found, $skipped skipped, $EXPECTED_GEO_TESTS expected), so this run validated nothing about them."
+            printf '%s\n' "$cases"
+            exit 1
+          fi
+          echo "$ran geospatial tests ran against Iceberg $ICEBERG_VERSION."
